@@ -1,7 +1,7 @@
 import argparse
 import os
 join = os.path.join
-import glob
+import numpy as np
 import torch
 from torch import nn
 import torchvision
@@ -10,6 +10,7 @@ from tqdm import tqdm
 import random
 import logging
 from datetime import datetime
+from diffusers import UNet2DModel
 
 extensions = ['*.jpg', '*.jpeg', '*.JPEG', '*.png', '*.bmp']
 
@@ -112,38 +113,44 @@ class EDM():
 
 ## model creater
 def create_model(config):
-    if config.architecture == 'diffuser':
-        from diffusers import UNet2DModel
-        unet = UNet2DModel(
-                    sample_size=config.img_size,
-                    in_channels=config.channels,
-                    out_channels=config.channels,
-                    layers_per_block=6,
-                    block_out_channels=(128,128,128,256),
-                    down_block_types=(
-                        "DownBlock2D",  # AttnDownBlock2D
-                        "DownBlock2D",
-                        "DownBlock2D",
-                        "DownBlock2D",
-                    ),
-                    up_block_types=(
-                        "UpBlock2D",    # AttnUpBlock2D
-                        "UpBlock2D",
-                        "UpBlock2D",
-                        "UpBlock2D",
-                    ),
-                    )
-    elif config.architecture == 'SongUnet':
-        from networks_edm import SongUNet
-        unet = SongUNet(in_channels=config.channels, out_channels=config.channels, embedding_type='positional', encoder_type='standard', decoder_type='standard', \
-                        channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[2,2,2], \
-                            augment_dim=9, dropout=0.13, img_resolution=config.img_size, label_dim=0)
+    ## get block_out_channels using model_channels and channel_mult
+    block_out_channels = []
+    for i in range(len(config.channel_mult)):
+        block_out_channels.append(config.model_channels*config.channel_mult[i])
+    block_out_channels = tuple(block_out_channels)
+    ## get down_block_types and up_block_types using config.img_size, config.attn_resolutions and config.channel_mult
+    down_block_types = []
+    up_block_types = []
+    for i in range(len(config.channel_mult)):
+        res = config.img_size >> i
+        if res in config.attn_resolutions:
+            down_block_types.append("AttnDownBlock2D")
+        else:
+            down_block_types.append("DownBlock2D")
+        if config.img_size // res in config.attn_resolutions:
+            up_block_types.append("AttnUpBlock2D")
+        else:
+            up_block_types.append("UpBlock2D")
+    down_block_types = tuple(down_block_types)
+    up_block_types = tuple(up_block_types)
+    ## create model
+    unet = UNet2DModel(
+                sample_size=config.img_size,
+                in_channels=config.channels,
+                out_channels=config.channels,
+                layers_per_block=config.layers_per_block,
+                block_out_channels=block_out_channels,
+                down_block_types=down_block_types,
+                up_block_types=up_block_types,
+                norm_num_groups=min(32, config.model_channels),
+                )
     return unet
     
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--expr", type=str, default="base")
+    parser.add_argument("--dataset", type=str, default="mnist")
     parser.add_argument('--seed', default=42, type=int, help='global seed')
     parser.add_argument("--train_batch_size", type=int, default=16)
     parser.add_argument("--num_steps", type=int, default=200000)
@@ -162,14 +169,19 @@ if __name__ == "__main__":
     parser.add_argument("--save_images_step", type=int, default=1000)
     parser.add_argument("--eval_batch_size", type=int, default=64)
     # Model architecture
-    parser.add_argument('--architecture', default='SongUnet', type=str, help='unet architecture')
-    parser.add_argument("--channels", type=int, default=3)
+    parser.add_argument('--model_channels', default=64, type=int, help='model_channels')
+    parser.add_argument('--channel_mult', default=[1,2,2,2], type=int, nargs='+', help='channel_mult')
+    parser.add_argument('--attn_resolutions', default=[], type=int, nargs='+', help='attn_resolutions')
+    parser.add_argument('--layers_per_block', default=4, type=int, help='num_blocks')
     
     config = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     config.device = device
+    channels = {'mnist': 1, 'cifar10': 3}
+    config.channels = channels[config.dataset]
+
     # workdir setup
-    config.expr = f"{config.expr}_{config.architecture}"
+    config.expr = f"{config.expr}"
     run_id = datetime.now().strftime("%Y%m%d-%H%M")
     outdir = f"exps/{config.expr}_{run_id}"
     os.makedirs(outdir, exist_ok=True)
@@ -191,17 +203,30 @@ if __name__ == "__main__":
     torch.manual_seed(config.seed)
 
     ## load dataset
-    img_dataset = torchvision.datasets.CIFAR10(root='datasets/cifar', download=True,
+    ### create dataloader
+    if config.dataset == 'mnist':
+        img_dataset = torchvision.datasets.MNIST(root='datasets/mnist', download=True,
                                             transform=torchvision.transforms.Compose(
-                                                [torchvision.transforms.RandomHorizontalFlip(),
+                                                [torchvision.transforms.Resize(config.img_size),
+                                                    torchvision.transforms.ToTensor(),
+                                                    torchvision.transforms.Normalize((0.5,), (0.5,))]
+                                            ),)
+    elif config.dataset == 'cifar10':
+        img_dataset = torchvision.datasets.CIFAR10(root='datasets/cifar', download=True,
+                                            transform=torchvision.transforms.Compose(
+                                                [torchvision.transforms.Resize(config.img_size),
+                                                    torchvision.transforms.RandomHorizontalFlip(),
                                                     torchvision.transforms.ToTensor(),
                                                     torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
                                             ),)
+    else:
+        raise NotImplementedError(f'dataset {config.dataset} not implemented')
     dataloader = torch.utils.data.DataLoader(img_dataset,
                                                 batch_size=config.train_batch_size,
                                                 shuffle=True,
                                                 num_workers=0,
                                                 pin_memory=True)
+    logger.info(f'length of dataloader: {len(dataloader)}')
 
     ## init model
     unet = create_model(config)
@@ -216,6 +241,7 @@ if __name__ == "__main__":
     # optimizer = torch.optim.Adam(edm.model.parameters(),lr=config.learning_rate)
 
     logger.info("#################### Training ####################")
+    train_loss_values = []
     progress_bar = tqdm(total=config.num_steps)
     for step in range(config.num_steps):
         batch_loss = torch.tensor(0.0, device=device)
@@ -231,17 +257,18 @@ if __name__ == "__main__":
         optimizer.step()
         optimizer.zero_grad()
         progress_bar.update(1)
-        logs = {"loss": loss.detach().item(), "step": step}
+        train_loss_values.append(batch_loss.detach().item())
+        logs = {"loss": loss.detach().item()}
         progress_bar.set_postfix(**logs)
         ## save images
-        if step % config.save_images_step == 0 or step == config.num_steps - 1:
+        if config.save_images_step and (step % config.save_images_step == 0 or step == config.num_steps - 1):
             # generate data with the model to later visualize the learning process
             edm.model.eval()
             x_T = torch.randn([config.eval_batch_size, config.channels, config.img_size, config.img_size]).to(device).float()
             sample = edm_sampler(edm, x_T, num_steps=config.total_steps).detach().cpu()
             save_image((sample/2+0.5).clamp(0, 1), f'{outdir}/image_{step}.png')
-            logger.info(f'loss: {batch_loss.detach().item()}, step: {step}')
+            logger.info(f'step: {step:08d}, average loss: {np.average(train_loss_values):0.10f}; batch loss: {batch_loss.detach().item():0.10f}')
             edm.model.train()
         ## save model
-        if config.save_model_iters and step % config.save_model_iters == 0 or step == config.num_steps - 1:
+        if config.save_model_iters and (step % config.save_model_iters == 0 or step == config.num_steps - 1) and step > 0:
             torch.save(edm.model.state_dict(), f"{outdir}/model_{step}.pth")

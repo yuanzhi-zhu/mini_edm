@@ -20,6 +20,7 @@ from edm import create_model
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--expr", type=str, default="sampling", help="experiment name")
+    parser.add_argument("--dataset", type=str, default="mnist")
     parser.add_argument('--seed', default=42, type=int, help='global seed')
     parser.add_argument("--img_size", type=int, default=32)
     parser.add_argument("--model_paths", default='', type=str, help='model paths')
@@ -36,14 +37,19 @@ if __name__ == "__main__":
     parser.add_argument('--num_fid_sample', default=10000, type=int, help='num_fid_sample')
     parser.add_argument('--t_path', default='./CIFAR-10-images/train', type=str, help='source clean image path')
     # Model architecture
-    parser.add_argument('--architecture', default='SongUnet', type=str, help='unet architecture')
-    parser.add_argument("--channels", type=int, default=3)
+    parser.add_argument('--model_channels', default=64, type=int, help='model_channels')
+    parser.add_argument('--channel_mult', default=[1,2,2,2], type=int, nargs='+', help='channel_mult')
+    parser.add_argument('--attn_resolutions', default=[], type=int, nargs='+', help='attn_resolutions')
+    parser.add_argument('--layers_per_block', default=4, type=int, help='num_blocks')
     
     config = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     config.device = device
+    channels = {'mnist': 1, 'cifar10': 3}
+    config.channels = channels[config.dataset]
+
     # workdir setup
-    config.expr = f"{config.expr}_{config.architecture}"
+    config.expr = f"{config.expr}"
     run_id = datetime.now().strftime("%Y%m%d-%H%M")
     outdir = f"exps/{config.expr}_{run_id}"
     os.makedirs(outdir, exist_ok=True)
