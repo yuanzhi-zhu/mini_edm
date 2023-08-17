@@ -181,7 +181,7 @@ if __name__ == "__main__":
     config.channels = channels[config.dataset]
 
     # workdir setup
-    config.expr = f"{config.expr}"
+    config.expr = f"{config.expr}_{config.dataset}"
     run_id = datetime.now().strftime("%Y%m%d-%H%M")
     outdir = f"exps/{config.expr}_{run_id}"
     os.makedirs(outdir, exist_ok=True)

@@ -8,6 +8,15 @@ echo " "
 
 ###########################################################################################################
 
+# # Define data set
+# DATASET="cifar10"
+
+# # Define model architecture parameters
+# CHANNEL_MULT="1 1 1 2"
+# MODEL_CHANNELS="128"
+# ATTN_RESOLUTIONS="0"
+# LAYERS_PER_BLOCK="6"
+
 # Define data set
 DATASET="mnist"
 
