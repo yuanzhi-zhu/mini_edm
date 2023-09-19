@@ -158,6 +158,8 @@ if __name__ == "__main__":
     parser.add_argument("--img_size", type=int, default=32)
     parser.add_argument("--accumulation_steps", type=int, default=16)
     parser.add_argument("--save_model_iters", type=int, default=5000)
+    parser.add_argument("--train_dataset", action='store_true', default=False)
+    parser.add_argument("--desired_class", type=str, default='all')
     # EDM models parameters
     parser.add_argument('--gt_guide_type', default='l2', type=str, help='gt_guide_type loss type')
     parser.add_argument('--sigma_min', default=0.002, type=float, help='sigma_min')
@@ -205,22 +207,31 @@ if __name__ == "__main__":
     ## load dataset
     ### create dataloader
     if config.dataset == 'mnist':
-        img_dataset = torchvision.datasets.MNIST(root='datasets/mnist', download=True,
+        img_dataset = torchvision.datasets.MNIST(root='datasets/mnist', download=True, train=config.train_dataset,
                                             transform=torchvision.transforms.Compose(
                                                 [torchvision.transforms.Resize(config.img_size),
                                                     torchvision.transforms.ToTensor(),
                                                     torchvision.transforms.Normalize((0.5,), (0.5,))]
                                             ),)
+        # mnist class labels
+        classes = ['0 - zero', '1 - one', '2 - two', '3 - three', '4 - four',
+                    '5 - five', '6 - six', '7 - seven', '8 - eight', '9 - nine']
     elif config.dataset == 'cifar10':
-        img_dataset = torchvision.datasets.CIFAR10(root='datasets/cifar', download=True,
+        img_dataset = torchvision.datasets.CIFAR10(root='datasets/cifar', download=True, train=config.train_dataset,
                                             transform=torchvision.transforms.Compose(
                                                 [torchvision.transforms.Resize(config.img_size),
                                                     torchvision.transforms.RandomHorizontalFlip(),
                                                     torchvision.transforms.ToTensor(),
                                                     torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
                                             ),)
+        # CIFAR10 class labels
+        classes = ['plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
     else:
         raise NotImplementedError(f'dataset {config.dataset} not implemented')
+    # Filter the dataset to only keep desired_class images
+    if config.desired_class != 'all':
+        class_idx = classes.index(config.desired_class)
+        img_dataset = [(img, label) for img, label in img_dataset if label == class_idx]
     dataloader = torch.utils.data.DataLoader(img_dataset,
                                                 batch_size=config.train_batch_size,
                                                 shuffle=True,
