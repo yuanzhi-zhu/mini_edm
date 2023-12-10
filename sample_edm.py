@@ -3,6 +3,7 @@ import os
 join = os.path.join
 import glob
 import torch
+import torchvision
 from torchvision.utils import save_image
 from tqdm import tqdm
 import random
@@ -13,9 +14,81 @@ extensions = ['*.jpg', '*.jpeg', '*.JPEG', '*.png', '*.bmp']
 #----------------------------------------------------------------------------
 # EDM sampler & EDM model
 
-from edm import edm_sampler
-from edm import EDM
-from edm import create_model
+from train_edm import edm_sampler
+from train_edm import EDM
+from train_edm import create_model
+
+class ResizeDataset(torch.utils.data.Dataset):
+    """
+    A placeholder Dataset that enables parallelizing the resize operation
+    using multiple CPU cores
+
+    files: list of all files in the folder
+    fn_resize: function that takes an np_array as input [0,255]
+    """
+
+    def __init__(self, files, mode, size=(299, 299), fdir=None):
+        self.files = files
+        self.fdir = fdir
+        self.transforms = torchvision.transforms.ToTensor()
+        self.size = size
+        self.fn_resize = fid.build_resizer(mode)
+        self.custom_image_tranform = lambda x: x
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, i):
+        img_np = self.files[i]
+        # apply a custom image transform before resizing the image to 299x299
+        img_np = self.custom_image_tranform(img_np)
+        # fn_resize expects a np array and returns a np array
+        img_resized = self.fn_resize(img_np)
+
+        # ToTensor() converts to [0,1] only if input in uint8
+        if img_resized.dtype == "uint8":
+            img_t = self.transforms(np.array(img_resized)) * 255
+        elif img_resized.dtype == "float32":
+            img_t = self.transforms(img_resized)
+
+        return img_t
+
+
+# https://github.com/openai/consistency_models_cifar10/blob/main/jcm/metrics.py#L117
+def compute_fid(
+    samples,
+    feat_model,
+    dataset_name="cifar10",
+    dataset_res=32,
+    dataset_split="train",
+    batch_size=512,
+    num_workers=12,
+    mode="legacy_tensorflow",
+    device=torch.device("cuda:0"),
+    seed=0,
+):
+    dataset = ResizeDataset(samples, mode=mode)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+    )
+    l_feats = []
+    for batch in tqdm(dataloader):
+        l_feats.append(fid.get_batch_features(batch, feat_model, device))
+    np_feats = np.concatenate(l_feats)
+    mu = np.mean(np_feats, axis=0)
+    sigma = np.cov(np_feats, rowvar=False)
+    ref_mu, ref_sigma = fid.get_reference_statistics(
+        dataset_name, dataset_res, mode=mode, seed=seed, split=dataset_split
+    )
+
+    score = fid.frechet_distance(mu, sigma, ref_mu, ref_sigma)
+
+    return score
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -48,12 +121,6 @@ if __name__ == "__main__":
     channels = {'mnist': 1, 'cifar10': 3}
     config.channels = channels[config.dataset]
 
-    # workdir setup
-    config.expr = f"{config.expr}_{config.dataset}_{config.sample_mode}"
-    run_id = datetime.now().strftime("%Y%m%d-%H%M")
-    outdir = f"exps/{config.expr}_{run_id}"
-    os.makedirs(outdir, exist_ok=True)
-
     print("#################### Arguments: ####################")
     for arg in vars(config):
         print(f"\t{arg}: {getattr(config, arg)}")
@@ -69,23 +136,20 @@ if __name__ == "__main__":
     edm = EDM(model=unet, cfg=config)
     ## set up fid recorder
     if config.sample_mode == 'fid':
-        fid_tmp_dir = outdir
-        os.makedirs(fid_tmp_dir, exist_ok=True)
-        # Create a list of all image file paths in the folder and its subfolders
-        src_image_paths = []
-        for extension in extensions:
-            search_path = os.path.join(config.t_path, '**', extension)
-            src_image_paths.extend(glob.glob(search_path, recursive=True))
-        src_image_paths_fid = random.sample(src_image_paths, config.num_fid_sample)
-        from pytorch_fid.fid_score import calculate_activation_statistics, calculate_frechet_distance
-        from pytorch_fid.inception import InceptionV3
-        # Load a pre-trained Inception-v3 model and move it to the appropriate device
-        dims = 2048
-        block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
-        fid_device = device # torch.device('cpu')
-        InceptionV3_model = InceptionV3([block_idx]).to(fid_device)
-        InceptionV3_model.eval()
-        real_features = calculate_activation_statistics(src_image_paths_fid, InceptionV3_model, batch_size=min(128, len(src_image_paths_fid)), device=fid_device)
+        import numpy as np
+        from cleanfid import fid
+        ### build feature extractor
+        mode = "legacy_tensorflow"
+        feat_model = fid.build_feature_extractor(mode, device)
+    elif config.sample_mode == 'save':
+        # workdir setup
+        config.expr = f"{config.expr}_{config.dataset}_{config.sample_mode}"
+        run_id = datetime.now().strftime("%Y%m%d-%H%M")
+        outdir = f"exps/{config.expr}_{run_id}"
+        os.makedirs(outdir, exist_ok=True)
+    else:
+        raise NotImplementedError(f"sample_mode: {config.sample_mode} not implemented!")
+
     # Free any unused GPU memory
     torch.cuda.empty_cache()
 
@@ -95,6 +159,7 @@ if __name__ == "__main__":
     for extension in model_extensions:
         search_path = os.path.join(config.model_paths, '**', extension)
         model_paths.extend(glob.glob(search_path, recursive=True))
+        model_paths.sort()
     for model_path in model_paths:
         print(f"#################### Model path: {model_path} ####################")
         ## get model name
@@ -108,24 +173,33 @@ if __name__ == "__main__":
         if config.sample_mode == 'fid':
             # save samples for fid calculation
             fid_batch_size = config.fid_batch_size
-            fid_iters = config.num_fid_sample // fid_batch_size
-            with torch.no_grad():
-                for i in tqdm(range(fid_iters)):
+            fid_iters = config.num_fid_sample // fid_batch_size + 1
+            # sampling
+            all_samples = []
+            for r in range(fid_iters):
+                with torch.no_grad():
                     noise = torch.randn([fid_batch_size, config.channels, config.img_size, config.img_size]).to(device)
-                    sample = edm_sampler(edm, noise, num_steps=config.total_steps).detach().cpu()
-                    sample.mul_(0.5).add_(0.5)
-                    for j in range(fid_batch_size):
-                        save_image(sample[j], f"{fid_tmp_dir}/{fid_batch_size*i+j}.jpg")
-                gen_image_paths = []
-                for extension in extensions:
-                    search_path = os.path.join(fid_tmp_dir, '**', extension)
-                    gen_image_paths.extend(glob.glob(search_path, recursive=True))
-                # Calculate the FID score
-                gen_features = calculate_activation_statistics(gen_image_paths, InceptionV3_model, device=fid_device)
-                fid_score = calculate_frechet_distance(real_features[0], real_features[1], \
-                                                        gen_features[0], gen_features[1])
-            print(f'model: {model_name}; fid_score: {fid_score}')
+                    samples = edm_sampler(edm, noise, num_steps=config.total_steps).detach().cpu()
+                    samples.mul_(0.5).add_(0.5)
+                print(f"fid sampling -- model_name: {model_name}, round: {r}, steps: {config.total_steps*2-1}")
+                samples = np.clip(samples.permute(0, 2, 3, 1).cpu().numpy() * 255., 0, 255).astype(np.uint8)
+                samples = samples.reshape((-1, config.img_size, config.img_size, config.channels))
+                all_samples.append(samples)
+
+            # compute FID
+            all_samples = np.concatenate(all_samples, axis=0)
+            fid_score = compute_fid(
+                        all_samples[: config.num_fid_sample],
+                        mode=mode,
+                        device=device,
+                        feat_model=feat_model,
+                        seed=config.seed,
+                        num_workers=0,
+                    )
+            print(f'model: {model_name}; fid_score: {fid_score:0.6f}')
+
         elif config.sample_mode == 'save':
             x_T = torch.randn([config.eval_batch_size, config.channels, config.img_size, config.img_size]).to(device).float()
             sample = edm_sampler(edm, x_T, num_steps=config.total_steps).detach().cpu()
             save_image((sample/2+0.5).clamp(0, 1), f'{outdir}/image_{model_name}.png')
+            print(f"save sample with shape {sample.shape} to {outdir}/image_{model_name}.png")

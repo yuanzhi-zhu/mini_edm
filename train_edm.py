@@ -17,7 +17,7 @@ extensions = ['*.jpg', '*.jpeg', '*.JPEG', '*.png', '*.bmp']
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2). (independent design)
 ## https://github.com/NVlabs/edm/blob/main/generate.py#L25
-
+## deterministic case
 @torch.no_grad()
 def edm_sampler(
     edm, latents, class_labels=None,
@@ -87,6 +87,7 @@ class EDM():
         return torch.einsum('b,bijk->bijk', c_skip, x) + torch.einsum('b,bijk->bijk', c_out, model_output)
         
     def train_step(self, images, labels=None, augment_pipe=None, **kwargs):
+        ### sigma sampling --> continuous & weighted sigma
         ## https://github.com/NVlabs/edm/blob/main/training/loss.py#L66
         rnd_normal = torch.randn([images.shape[0]], device=images.device)
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
@@ -111,7 +112,7 @@ class EDM():
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
 
-## model creater
+## UNet model creater
 def create_model(config):
     ## get block_out_channels using model_channels and channel_mult
     block_out_channels = []
@@ -150,7 +151,7 @@ def create_model(config):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--expr", type=str, default="base")
-    parser.add_argument("--dataset", type=str, default="mnist")
+    parser.add_argument("--dataset", type=str, default="cifar")
     parser.add_argument('--seed', default=42, type=int, help='global seed')
     parser.add_argument("--train_batch_size", type=int, default=16)
     parser.add_argument("--num_steps", type=int, default=200000)
@@ -158,8 +159,10 @@ if __name__ == "__main__":
     parser.add_argument("--img_size", type=int, default=32)
     parser.add_argument("--accumulation_steps", type=int, default=16)
     parser.add_argument("--save_model_iters", type=int, default=5000)
-    parser.add_argument("--train_dataset", action='store_true', default=False)
+    parser.add_argument("--log_step", type=int, default=500)
+    parser.add_argument("--train_dataset", action='store_true', default=True)
     parser.add_argument("--desired_class", type=str, default='all')
+    parser.add_argument("--train_progress_bar", action='store_true', default=False)
     # EDM models parameters
     parser.add_argument('--gt_guide_type', default='l2', type=str, help='gt_guide_type loss type')
     parser.add_argument('--sigma_min', default=0.002, type=float, help='sigma_min')
@@ -187,6 +190,10 @@ if __name__ == "__main__":
     run_id = datetime.now().strftime("%Y%m%d-%H%M")
     outdir = f"exps/{config.expr}_{run_id}"
     os.makedirs(outdir, exist_ok=True)
+    sample_dir = f"{outdir}/samples"
+    os.makedirs(sample_dir, exist_ok=True)
+    ckpt_dir = f"{outdir}/checkpoints"
+    os.makedirs(ckpt_dir, exist_ok=True)
     logging.basicConfig(filename=f'{outdir}/std.log', filemode='w', 
                         format='%(asctime)s %(levelname)s --> %(message)s',
                         level=logging.INFO,
@@ -244,7 +251,7 @@ if __name__ == "__main__":
     edm = EDM(model=unet, cfg=config)
     edm.model.train()
     logger.info("#################### Model: ####################")
-    logger.info(f'{unet}')
+    # logger.info(f'{unet}')
     logger.info(f'number of trainable parameters of phi model in optimizer: {sum(p.numel() for p in unet.parameters() if p.requires_grad)}')
 
     ## setup optimizer
@@ -252,8 +259,9 @@ if __name__ == "__main__":
     # optimizer = torch.optim.Adam(edm.model.parameters(),lr=config.learning_rate)
 
     logger.info("#################### Training ####################")
-    train_loss_values = []
-    progress_bar = tqdm(total=config.num_steps)
+    train_loss_values = 0
+    if config.train_progress_bar:
+        progress_bar = tqdm(total=config.num_steps)
     for step in range(config.num_steps):
         batch_loss = torch.tensor(0.0, device=device)
         # accumulation steps
@@ -267,19 +275,22 @@ if __name__ == "__main__":
         nn.utils.clip_grad_norm_(edm.model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad()
-        progress_bar.update(1)
-        train_loss_values.append(batch_loss.detach().item())
+        train_loss_values += (batch_loss.detach().item())
         logs = {"loss": loss.detach().item()}
-        progress_bar.set_postfix(**logs)
+        if config.train_progress_bar:
+            progress_bar.update(1) 
+            progress_bar.set_postfix(**logs)
+        ## log
+        if step % config.log_step == 0 or step == config.num_steps - 1:
+            logger.info(f'step: {step:08d}, average loss: {train_loss_values/(step+1):0.10f}; batch loss: {batch_loss.detach().item():0.10f}')
         ## save images
         if config.save_images_step and (step % config.save_images_step == 0 or step == config.num_steps - 1):
             # generate data with the model to later visualize the learning process
             edm.model.eval()
             x_T = torch.randn([config.eval_batch_size, config.channels, config.img_size, config.img_size]).to(device).float()
             sample = edm_sampler(edm, x_T, num_steps=config.total_steps).detach().cpu()
-            save_image((sample/2+0.5).clamp(0, 1), f'{outdir}/image_{step}.png')
-            logger.info(f'step: {step:08d}, average loss: {np.average(train_loss_values):0.10f}; batch loss: {batch_loss.detach().item():0.10f}')
+            save_image((sample/2+0.5).clamp(0, 1), f'{sample_dir}/image_{step}.png')
             edm.model.train()
         ## save model
         if config.save_model_iters and (step % config.save_model_iters == 0 or step == config.num_steps - 1) and step > 0:
-            torch.save(edm.model.state_dict(), f"{outdir}/model_{step}.pth")
+            torch.save(edm.model.state_dict(), f"{ckpt_dir}/model_{step}.pth")

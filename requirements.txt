@@ -1,3 +1,4 @@
+clean-fid==0.1.35
 accelerate==0.19.0
 diffusers @ git+https://github.com/huggingface/diffusers@1994dbcb5e62bd8d0c60e5d5d6bf4b580653c74c
 huggingface-hub==0.15.1
