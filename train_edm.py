@@ -102,7 +102,7 @@ class EDM():
             loss = torch.einsum('b,bijk->bijk', weight, (torch.abs(D_yn - y)))
         else:
             raise NotImplementedError(f'gt_guide_type {self.cfg.gt_guide_type} not implemented')
-        return loss.sum()
+        return loss.mean()
     
     def __call__(self, x, sigma, labels=None, augment_labels=None):
         if sigma.shape == torch.Size([]):
@@ -163,6 +163,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_dataset", action='store_true', default=True)
     parser.add_argument("--desired_class", type=str, default='all')
     parser.add_argument("--train_progress_bar", action='store_true', default=False)
+    parser.add_argument("--warmup", type=int, default=5000)
     # EDM models parameters
     parser.add_argument('--gt_guide_type', default='l2', type=str, help='gt_guide_type loss type')
     parser.add_argument('--sigma_min', default=0.002, type=float, help='sigma_min')
@@ -170,7 +171,7 @@ if __name__ == "__main__":
     parser.add_argument('--rho', default=7., type=float, help='Schedule hyper-parameter')
     parser.add_argument('--sigma_data', default=0.5, type=float, help='sigma_data used in EDM for c_skip and c_out')
     # Sampling parameters
-    parser.add_argument('--total_steps', default=20, type=int, help='total_steps')
+    parser.add_argument('--total_steps', default=18, type=int, help='total_steps')
     parser.add_argument("--save_images_step", type=int, default=1000)
     parser.add_argument("--eval_batch_size", type=int, default=64)
     # Model architecture
@@ -255,26 +256,35 @@ if __name__ == "__main__":
     logger.info(f'number of trainable parameters of phi model in optimizer: {sum(p.numel() for p in unet.parameters() if p.requires_grad)}')
 
     ## setup optimizer
-    optimizer = torch.optim.AdamW(edm.model.parameters(),lr=config.learning_rate)
-    # optimizer = torch.optim.Adam(edm.model.parameters(),lr=config.learning_rate)
+    # optimizer = torch.optim.AdamW(edm.model.parameters(),lr=config.learning_rate)
+    optimizer = torch.optim.Adam(edm.model.parameters(),lr=config.learning_rate)
 
     logger.info("#################### Training ####################")
     train_loss_values = 0
     if config.train_progress_bar:
         progress_bar = tqdm(total=config.num_steps)
     for step in range(config.num_steps):
+        optimizer.zero_grad()
         batch_loss = torch.tensor(0.0, device=device)
         # accumulation steps
         for _ in range(config.accumulation_steps):
-            batch, label_dic = next(iter(dataloader))
+            try:
+                batch, label_dic = next(data_iterator)
+            except:
+                data_iterator = iter(dataloader)
+                batch, label_dic = next(data_iterator)
             batch = batch.to(device)
             loss = edm.train_step(batch)
-            loss /= (config.accumulation_steps * config.train_batch_size)
+            loss /= (config.accumulation_steps)
             loss.backward()
             batch_loss += loss
-        nn.utils.clip_grad_norm_(edm.model.parameters(), 1.0)
+        # Update weights.
+        for g in optimizer.param_groups:
+            g['lr'] = config.learning_rate * min(step / config.warmup, 1)
+        for param in unet.parameters():
+            if param.grad is not None:
+                torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
         optimizer.step()
-        optimizer.zero_grad()
         train_loss_values += (batch_loss.detach().item())
         logs = {"loss": loss.detach().item()}
         if config.train_progress_bar:
@@ -282,7 +292,8 @@ if __name__ == "__main__":
             progress_bar.set_postfix(**logs)
         ## log
         if step % config.log_step == 0 or step == config.num_steps - 1:
-            logger.info(f'step: {step:08d}, average loss: {train_loss_values/(step+1):0.10f}; batch loss: {batch_loss.detach().item():0.10f}')
+            current_lr = optimizer.param_groups[0]['lr']
+            logger.info(f'step: {step:08d}, current lr: {current_lr:0.6f} average loss: {train_loss_values/(step+1):0.10f}; batch loss: {batch_loss.detach().item():0.10f}')
         ## save images
         if config.save_images_step and (step % config.save_images_step == 0 or step == config.num_steps - 1):
             # generate data with the model to later visualize the learning process

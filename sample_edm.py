@@ -2,6 +2,7 @@ import argparse
 import os
 join = os.path.join
 import glob
+import numpy as np
 import torch
 import torchvision
 from torchvision.utils import save_image
@@ -61,7 +62,7 @@ def compute_fid(
     dataset_name="cifar10",
     dataset_res=32,
     dataset_split="train",
-    batch_size=512,
+    batch_size=128,
     num_workers=12,
     mode="legacy_tensorflow",
     device=torch.device("cuda:0"),
@@ -103,7 +104,7 @@ if __name__ == "__main__":
     parser.add_argument('--rho', default=7., type=float, help='Schedule hyper-parameter')
     parser.add_argument('--sigma_data', default=0.5, type=float, help='sigma_data used in EDM for c_skip and c_out')
     # Sampling parameters
-    parser.add_argument('--total_steps', default=20, type=int, help='total_steps')
+    parser.add_argument('--total_steps', default=18, type=int, help='total_steps')
     parser.add_argument("--eval_batch_size", type=int, default=64)
     parser.add_argument("--fid_batch_size", type=int, default=64)
     parser.add_argument("--sample_mode", type=str, default='fid', help='sample mode')
@@ -136,7 +137,6 @@ if __name__ == "__main__":
     edm = EDM(model=unet, cfg=config)
     ## set up fid recorder
     if config.sample_mode == 'fid':
-        import numpy as np
         from cleanfid import fid
         ### build feature extractor
         mode = "legacy_tensorflow"
@@ -159,8 +159,16 @@ if __name__ == "__main__":
     for extension in model_extensions:
         search_path = os.path.join(config.model_paths, '**', extension)
         model_paths.extend(glob.glob(search_path, recursive=True))
-        model_paths.sort()
+        model_paths = sorted(model_paths, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+        # model_paths = model_paths[3:]
     for model_path in model_paths:
+        ## set random seed everywhere
+        torch.manual_seed(config.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(config.seed)
+            torch.cuda.manual_seed_all(config.seed)  # for multi-GPU.
+        random.seed(config.seed)  # Python random module.
+        torch.manual_seed(config.seed)
         print(f"#################### Model path: {model_path} ####################")
         ## get model name
         model_name = model_path.split('/')[-1].split('.')[0]
