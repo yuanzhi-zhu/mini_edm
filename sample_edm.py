@@ -160,7 +160,7 @@ if __name__ == "__main__":
         search_path = os.path.join(config.model_paths, '**', extension)
         model_paths.extend(glob.glob(search_path, recursive=True))
         model_paths = sorted(model_paths, key=lambda x: int(x.split('_')[-1].split('.')[0]))
-        # model_paths = model_paths[3:]
+        # model_paths = model_paths[10:]
     for model_path in model_paths:
         ## set random seed everywhere
         torch.manual_seed(config.seed)
@@ -187,7 +187,7 @@ if __name__ == "__main__":
             for r in range(fid_iters):
                 with torch.no_grad():
                     noise = torch.randn([fid_batch_size, config.channels, config.img_size, config.img_size]).to(device)
-                    samples = edm_sampler(edm, noise, num_steps=config.total_steps).detach().cpu()
+                    samples = edm_sampler(edm, noise, num_steps=config.total_steps, use_ema=False).detach().cpu()
                     samples.mul_(0.5).add_(0.5)
                 print(f"fid sampling -- model_name: {model_name}, round: {r}, steps: {config.total_steps*2-1}")
                 samples = np.clip(samples.permute(0, 2, 3, 1).cpu().numpy() * 255., 0, 255).astype(np.uint8)
@@ -196,6 +196,8 @@ if __name__ == "__main__":
 
             # compute FID
             all_samples = np.concatenate(all_samples, axis=0)
+            print(f'all_samples shape: {all_samples.shape}')
+            print(f'{all_samples.mean()}, {all_samples.std()}')
             fid_score = compute_fid(
                         all_samples[: config.num_fid_sample],
                         mode=mode,

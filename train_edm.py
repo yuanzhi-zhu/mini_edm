@@ -1,16 +1,14 @@
 import argparse
 import os
 join = os.path.join
-import numpy as np
 import torch
-from torch import nn
 import torchvision
 from torchvision.utils import save_image
 from tqdm import tqdm
+import copy
 import random
 import logging
 from datetime import datetime
-from diffusers import UNet2DModel
 
 extensions = ['*.jpg', '*.jpeg', '*.JPEG', '*.png', '*.bmp']
 
@@ -22,6 +20,7 @@ extensions = ['*.jpg', '*.jpeg', '*.JPEG', '*.png', '*.bmp']
 def edm_sampler(
     edm, latents, class_labels=None,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    use_ema=True,
 ):
     # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, edm.sigma_min)
@@ -39,13 +38,13 @@ def edm_sampler(
         t_hat = t_cur
         
         # Euler step.
-        denoised = edm(x_hat, t_hat, class_labels).to(torch.float64)
+        denoised = edm(x_hat, t_hat, class_labels, use_ema=use_ema).to(torch.float64)
         d_cur = (x_hat - denoised) / t_hat
         x_next = x_hat + (t_next - t_hat) * d_cur
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
-            denoised = edm(x_next, t_next, class_labels).to(torch.float64)
+            denoised = edm(x_next, t_next, class_labels, use_ema=use_ema).to(torch.float64)
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
@@ -60,6 +59,7 @@ class EDM():
         self.cfg = cfg
         self.device = self.cfg.device
         self.model = model.to(self.device)
+        self.ema = copy.deepcopy(self.model).eval().requires_grad_(False)
         ## parameters
         self.sigma_min = cfg.sigma_min
         self.sigma_max = cfg.sigma_max
@@ -68,8 +68,10 @@ class EDM():
         self.P_mean = -1.2
         self.P_std = 1.2
         self.sigma_data = 0.5
+        self.ema_rampup_ratio = 0.05
+        self.ema_halflife_kimg = 500
 
-    def model_forward_wrapper(self, x, sigma, **kwargs):
+    def model_forward_wrapper(self, x, sigma, use_ema=False, **kwargs):
         """Wrapper for the model call"""
         sigma[sigma == 0] = self.sigma_min
         ## edm preconditioning for input and output
@@ -79,7 +81,10 @@ class EDM():
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
         c_noise = sigma.log() / 4
         label = kwargs['labels'] if 'labels' in kwargs else None
-        model_output = self.model(torch.einsum('b,bijk->bijk', c_in, x), c_noise, class_labels=label)
+        if use_ema:
+            model_output = self.ema(torch.einsum('b,bijk->bijk', c_in, x), c_noise, class_labels=label)
+        else:
+            model_output = self.model(torch.einsum('b,bijk->bijk', c_in, x), c_noise, class_labels=label)
         try:
             model_output = model_output.sample
         except:
@@ -104,47 +109,42 @@ class EDM():
             raise NotImplementedError(f'gt_guide_type {self.cfg.gt_guide_type} not implemented')
         return loss.mean()
     
-    def __call__(self, x, sigma, labels=None, augment_labels=None):
+    def update_ema(self):
+        ema_halflife_nimg = self.ema_halflife_kimg * 1000
+        if self.ema_rampup_ratio is not None:
+            ema_halflife_nimg = min(ema_halflife_nimg, step * config.train_batch_size * self.ema_rampup_ratio)
+        ema_beta = 0.5 ** (config.train_batch_size / max(ema_halflife_nimg, 1e-8))
+        for p_ema, p_net in zip(self.ema.parameters(), self.model.parameters()):
+            p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
+    
+    # used for sampling, set use_ema=True
+    def __call__(self, x, sigma, labels=None, augment_labels=None, use_ema=True):
         if sigma.shape == torch.Size([]):
             sigma = sigma * torch.ones([x.shape[0]]).to(x.device)
-        return self.model_forward_wrapper(x.float(), sigma.float(), labels=labels, augment_labels=augment_labels)
+        return self.model_forward_wrapper(x.float(), sigma.float(), use_ema=use_ema, labels=labels, augment_labels=augment_labels)
 
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
 
 ## UNet model creater
 def create_model(config):
-    ## get block_out_channels using model_channels and channel_mult
-    block_out_channels = []
-    for i in range(len(config.channel_mult)):
-        block_out_channels.append(config.model_channels*config.channel_mult[i])
-    block_out_channels = tuple(block_out_channels)
-    ## get down_block_types and up_block_types using config.img_size, config.attn_resolutions and config.channel_mult
-    down_block_types = []
-    up_block_types = []
-    for i in range(len(config.channel_mult)):
-        res = config.img_size >> i
-        if res in config.attn_resolutions:
-            down_block_types.append("AttnDownBlock2D")
-        else:
-            down_block_types.append("DownBlock2D")
-        if config.img_size // res in config.attn_resolutions:
-            up_block_types.append("AttnUpBlock2D")
-        else:
-            up_block_types.append("UpBlock2D")
-    down_block_types = tuple(down_block_types)
-    up_block_types = tuple(up_block_types)
-    ## create model
-    unet = UNet2DModel(
-                sample_size=config.img_size,
-                in_channels=config.channels,
-                out_channels=config.channels,
-                layers_per_block=config.layers_per_block,
-                block_out_channels=block_out_channels,
-                down_block_types=down_block_types,
-                up_block_types=up_block_types,
-                norm_num_groups=min(32, config.model_channels),
-                )
+    from networks_edm import SongUNet
+    unet = SongUNet(in_channels=config.channels, 
+                    out_channels=config.channels, 
+                    num_blocks=config.layers_per_block, 
+                    attn_resolutions=config.attn_resolutions, 
+                    model_channels=config.model_channels, 
+                    channel_mult=config.channel_mult, 
+                    dropout=0.13, 
+                    img_resolution=config.img_size, 
+                    label_dim=0,
+                    embedding_type='positional', 
+                    encoder_type='standard', 
+                    decoder_type='standard', 
+                    augment_dim=9, 
+                    channel_mult_noise=1, 
+                    resample_filter=[1,1], 
+                    )
     return unet
     
 
@@ -286,8 +286,11 @@ if __name__ == "__main__":
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
         optimizer.step()
         train_loss_values += (batch_loss.detach().item())
-        logs = {"loss": loss.detach().item()}
+        ## Update EMA.
+        edm.update_ema()
+        ## Update state
         if config.train_progress_bar:
+            logs = {"loss": loss.detach().item()}
             progress_bar.update(1) 
             progress_bar.set_postfix(**logs)
         ## log
@@ -304,4 +307,5 @@ if __name__ == "__main__":
             edm.model.train()
         ## save model
         if config.save_model_iters and (step % config.save_model_iters == 0 or step == config.num_steps - 1) and step > 0:
-            torch.save(edm.model.state_dict(), f"{ckpt_dir}/model_{step}.pth")
+            # torch.save(edm.model.state_dict(), f"{ckpt_dir}/model_{step}.pth")
+            torch.save(edm.ema.state_dict(), f"{ckpt_dir}/ema_{step}.pth")
