@@ -161,6 +161,7 @@ if __name__ == "__main__":
         model_paths.extend(glob.glob(search_path, recursive=True))
         model_paths = sorted(model_paths, key=lambda x: int(x.split('_')[-1].split('.')[0]))
         # model_paths = model_paths[10:]
+    print(f'Found model_paths {model_paths}')
     for model_path in model_paths:
         ## set random seed everywhere
         torch.manual_seed(config.seed)
@@ -210,6 +211,6 @@ if __name__ == "__main__":
 
         elif config.sample_mode == 'save':
             x_T = torch.randn([config.eval_batch_size, config.channels, config.img_size, config.img_size]).to(device).float()
-            sample = edm_sampler(edm, x_T, num_steps=config.total_steps).detach().cpu()
+            sample = edm_sampler(edm, x_T, num_steps=config.total_steps, use_ema=False).detach().cpu()
             save_image((sample/2+0.5).clamp(0, 1), f'{outdir}/image_{model_name}.png')
             print(f"save sample with shape {sample.shape} to {outdir}/image_{model_name}.png")
