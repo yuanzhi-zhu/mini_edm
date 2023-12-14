@@ -145,6 +145,10 @@ def create_model(config):
                     channel_mult_noise=1, 
                     resample_filter=[1,1], 
                     )
+    pytorch_total_grad_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    logging.info(f'total number of trainable parameters in the Score Model: {pytorch_total_grad_params}')
+    pytorch_total_params = sum(p.numel() for p in unet.parameters())
+    logging.info(f'total number of parameters in the Score Model: {pytorch_total_params}')
     return unet
     
 

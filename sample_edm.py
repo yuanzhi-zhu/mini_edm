@@ -9,6 +9,7 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 import random
 from datetime import datetime
+import logging
 
 extensions = ['*.jpg', '*.jpeg', '*.JPEG', '*.png', '*.bmp']
 
@@ -110,6 +111,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample_mode", type=str, default='fid', help='sample mode')
     parser.add_argument('--num_fid_sample', default=10000, type=int, help='num_fid_sample')
     parser.add_argument('--t_path', default='./CIFAR-10-images/train', type=str, help='source clean image path')
+    parser.add_argument('--begin_ckpt', default=0, type=int, help='begin_ckpt')
     # Model architecture
     parser.add_argument('--model_channels', default=64, type=int, help='model_channels')
     parser.add_argument('--channel_mult', default=[1,2,2,2], type=int, nargs='+', help='channel_mult')
@@ -122,9 +124,15 @@ if __name__ == "__main__":
     channels = {'mnist': 1, 'cifar10': 3}
     config.channels = channels[config.dataset]
 
-    print("#################### Arguments: ####################")
+    logging.basicConfig(filename=f'{config.model_paths}/eval.log', filemode='a+', 
+                        format='%(asctime)s %(levelname)s --> %(message)s',
+                        level=logging.INFO,
+                        datefmt='%Y-%m-%d %H:%M:%S')
+    logger = logging.getLogger()
+
+    logger.info("#################### Arguments: ####################")
     for arg in vars(config):
-        print(f"\t{arg}: {getattr(config, arg)}")
+        logger.info(f"\t{arg}: {getattr(config, arg)}")
     ## set random seed everywhere
     torch.manual_seed(config.seed)
     if torch.cuda.is_available():
@@ -136,6 +144,7 @@ if __name__ == "__main__":
     unet = create_model(config)
     edm = EDM(model=unet, cfg=config)
     ## set up fid recorder
+    logger.info(f"Sampling mode: {config.sample_mode}")
     if config.sample_mode == 'fid':
         from cleanfid import fid
         ### build feature extractor
@@ -160,8 +169,8 @@ if __name__ == "__main__":
         search_path = os.path.join(config.model_paths, '**', extension)
         model_paths.extend(glob.glob(search_path, recursive=True))
         model_paths = sorted(model_paths, key=lambda x: int(x.split('_')[-1].split('.')[0]))
-        # model_paths = model_paths[10:]
-    print(f'Found model_paths {model_paths}')
+        model_paths = model_paths[config.begin_ckpt:]
+    logger.info(f'Found model_paths {model_paths}')
     for model_path in model_paths:
         ## set random seed everywhere
         torch.manual_seed(config.seed)
@@ -170,11 +179,11 @@ if __name__ == "__main__":
             torch.cuda.manual_seed_all(config.seed)  # for multi-GPU.
         random.seed(config.seed)  # Python random module.
         torch.manual_seed(config.seed)
-        print(f"#################### Model path: {model_path} ####################")
         ## get model name
         model_name = model_path.split('/')[-1].split('.')[0]
         ## load model
         checkpoint = torch.load(model_path, map_location=device)
+        logger.info(f"loaded model: {model_name}")
         edm.model.load_state_dict(checkpoint)
         for param in edm.model.parameters():
             param.requires_grad = False
@@ -190,15 +199,15 @@ if __name__ == "__main__":
                     noise = torch.randn([fid_batch_size, config.channels, config.img_size, config.img_size]).to(device)
                     samples = edm_sampler(edm, noise, num_steps=config.total_steps, use_ema=False).detach().cpu()
                     samples.mul_(0.5).add_(0.5)
-                print(f"fid sampling -- model_name: {model_name}, round: {r}, steps: {config.total_steps*2-1}")
+                logger.info(f"fid sampling -- model_name: {model_name}, round: {r}, steps: {config.total_steps*2-1}")
                 samples = np.clip(samples.permute(0, 2, 3, 1).cpu().numpy() * 255., 0, 255).astype(np.uint8)
                 samples = samples.reshape((-1, config.img_size, config.img_size, config.channels))
                 all_samples.append(samples)
 
             # compute FID
             all_samples = np.concatenate(all_samples, axis=0)
-            print(f'all_samples shape: {all_samples.shape}')
-            print(f'{all_samples.mean()}, {all_samples.std()}')
+            logger.info(f'all_samples shape: {all_samples.shape}')
+            logger.info(f'{all_samples.mean()}, {all_samples.std()}')
             fid_score = compute_fid(
                         all_samples[: config.num_fid_sample],
                         mode=mode,
@@ -207,10 +216,11 @@ if __name__ == "__main__":
                         seed=config.seed,
                         num_workers=0,
                     )
-            print(f'model: {model_name}; fid_score: {fid_score:0.6f}')
+            logger.info(f'model: {model_name}; fid_score: {fid_score:0.6f}')
 
         elif config.sample_mode == 'save':
             x_T = torch.randn([config.eval_batch_size, config.channels, config.img_size, config.img_size]).to(device).float()
             sample = edm_sampler(edm, x_T, num_steps=config.total_steps, use_ema=False).detach().cpu()
             save_image((sample/2+0.5).clamp(0, 1), f'{outdir}/image_{model_name}.png')
-            print(f"save sample with shape {sample.shape} to {outdir}/image_{model_name}.png")
+            logger.info(f"save sample with shape {sample.shape} to {outdir}/image_{model_name}.png")
+    logger.info(f"#################### Done! ####################")
