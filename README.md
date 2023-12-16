@@ -11,7 +11,7 @@ Results FID on CIFAIR-10:
   <em>FID of this implementation.</em>
 </p>
 
-Reference FID from the original EDM codebase using the same model architecture and the same batch size of 128 (nothing else changed):
+Reference FID (each snapshot=5000k images=5000k/128 steps) from the original EDM codebase using the same model architecture and the same batch size of 128 (nothing else changed):
 
 <p align="center">
   <img src="figs/EDM_fid.png" width="900px"/>
