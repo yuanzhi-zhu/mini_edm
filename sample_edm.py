@@ -199,17 +199,17 @@ if __name__ == "__main__":
                     noise = torch.randn([fid_batch_size, config.channels, config.img_size, config.img_size]).to(device)
                     samples = edm_sampler(edm, noise, num_steps=config.total_steps, use_ema=False).detach().cpu()
                     samples.mul_(0.5).add_(0.5)
-                logger.info(f"fid sampling -- model_name: {model_name}, round: {r}, steps: {config.total_steps*2-1}")
+                # logger.info(f"fid sampling -- model_name: {model_name}, round: {r}, steps: {config.total_steps*2-1}")
                 samples = np.clip(samples.permute(0, 2, 3, 1).cpu().numpy() * 255., 0, 255).astype(np.uint8)
                 samples = samples.reshape((-1, config.img_size, config.img_size, config.channels))
                 all_samples.append(samples)
 
             # compute FID
-            all_samples = np.concatenate(all_samples, axis=0)
+            all_samples = np.concatenate(all_samples, axis=0)[: config.num_fid_sample]
             logger.info(f'all_samples shape: {all_samples.shape}')
             logger.info(f'{all_samples.mean()}, {all_samples.std()}')
             fid_score = compute_fid(
-                        all_samples[: config.num_fid_sample],
+                        all_samples,
                         mode=mode,
                         device=device,
                         feat_model=feat_model,
